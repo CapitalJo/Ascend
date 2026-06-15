@@ -81,7 +81,7 @@ function ScoreMeter({ score }) {
 
 // ─── API CALL ─────────────────────────────────────────────────
 async function callClaude(apiKey, messages, systemPrompt) {
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  const resp = await fetch("/api/claude", {
     method:"POST",
     headers:{ "Content-Type":"application/json", "x-api-key":apiKey, "anthropic-version":"2023-06-01" },
     body:JSON.stringify({
@@ -773,3 +773,4 @@ Return only the letter text, ready to send.`;
     </div>
   );
 }
+
