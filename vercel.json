@@ -1,8 +1,8 @@
 {
-  "buildCommand": "cd 'Ascend App' && npm install && npm run build",
-  "outputDirectory": "Ascend App/dist",
+  "rootDirectory": "Ascend App",
+  "buildCommand": "npm install && npm run build",
+  "outputDirectory": "dist",
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
