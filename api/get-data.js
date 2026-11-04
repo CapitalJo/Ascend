@@ -23,7 +23,7 @@ export default async function handler(req, res) {
     res.json({
       accounts: (acctData.accounts||[]).map(a => ({
         id: a.account_id, name: a.name, institution: a.official_name||a.name,
-        balance: a.balances.current, type: a.type, subtype: a.subtype,
+        balance: a.balances.current, limit: a.balances.limit ?? null, type: a.type, subtype: a.subtype,
       })),
       transactions: (txnData.transactions||[]).map(t => ({
         id: t.transaction_id, date: t.date, description: t.name,
