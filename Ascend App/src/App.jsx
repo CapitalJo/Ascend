@@ -493,87 +493,102 @@ function MoneyTab({ state, setState, apiKey }) {
   const [plaidLoading, setPlaidLoading] = useState(false);
   const [plaidError, setPlaidError] = useState(null);
 
-  const connectBank = async () => {
-    setPlaidLoading(true); setPlaidError(null);
-    try {
-      // Get link token from our backend
-      const ltResp = await fetch("/api/create-link-token", { method:"POST", headers:{"Content-Type":"application/json"} });
-      const ltData = await ltResp.json();
-      if (!ltResp.ok) throw new Error(ltData.error || "Could not create link token");
+  const update = fn => setState(s => ({...s, ...fn(s)}));
+  const [syncing, setSyncing] = useState(false);
+  const syncingRef = useRef(false);
 
-      // Load Plaid Link
-      await new Promise((res, rej) => {
-        if (window.Plaid) return res();
-        const s = document.createElement("script");
-        s.src = "https://cdn.plaid.com/link/v2/stable/link-initialize.js";
-        s.onload = res; s.onerror = rej;
-        document.head.appendChild(s);
-      });
-
-      // Open Plaid Link
-      const handler = window.Plaid.create({
-        token: ltData.link_token,
-        onSuccess: async (public_token, metadata) => {
-          try {
-            // Exchange for access token
-            const exResp = await fetch("/api/exchange-token", {
-              method:"POST", headers:{"Content-Type":"application/json"},
-              body: JSON.stringify({ public_token })
-            });
-            const exData = await exResp.json();
-            if (!exResp.ok) throw new Error(exData.error);
-
-            // Get accounts and transactions
-            const dataResp = await fetch("/api/get-data", {
-              method:"POST", headers:{"Content-Type":"application/json"},
-              body: JSON.stringify({ access_token: exData.access_token })
-            });
-            const bankData = await dataResp.json();
-            if (!dataResp.ok) throw new Error(bankData.error);
-
-            // Merge into state
-            const existingIds = new Set((state.accounts||[]).map(a=>a.id));
-            const newAccounts = bankData.accounts.filter(a=>!existingIds.has(a.id));
-            const existingTxnIds = new Set((state.transactions||[]).map(t=>t.id));
-            const rules = state.rules||{};
-            const newTxns = bankData.transactions.filter(t=>!existingTxnIds.has(t.id)).map(t=>rules[merchantKey(t.description)]?{...t,category:rules[merchantKey(t.description)]}:t);
-
-            const ns = {
-              ...state,
-              accounts:[...(state.accounts||[]),...newAccounts],
-              transactions:[...(state.transactions||[]),...newTxns],
-              plaidTokens:[...(state.plaidTokens||[]),{ access_token:exData.access_token, institution:metadata.institution?.name||"Bank", item_id:exData.item_id }]
-            };
-            setState(ns); saveState(ns);
-            setPlaidLoading(false);
-          } catch(e) { setPlaidError("Error importing data: "+e.message); setPlaidLoading(false); }
-        },
-        onExit: () => setPlaidLoading(false),
-      });
-      handler.open();
-    } catch(e) { setPlaidError(e.message); setPlaidLoading(false); }
+  const post = async (url, body) => {
+    const r = await fetch(url, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body||{}) });
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok) { const e = new Error(d.error||"Request failed"); e.code = d.code; throw e; }
+    return d;
   };
 
-  const refreshBank = async (token) => {
-    setPlaidLoading(true);
+  // Merge fresh bank data. Values the bank provides win; manual entries stay where the bank has none.
+  const mergeBank = (s, bankData, token) => {
+    const rules = s.rules||{};
+    const clean = o => Object.fromEntries(Object.entries(o).filter(([,v])=>v!==null&&v!==undefined));
+    const fresh = Object.fromEntries(bankData.accounts.map(a=>[a.id,clean(a)]));
+    const tag = a => ({...a, linked:true, itemId:token.item_id, syncedAt:bankData.syncedAt, bankFields:Object.keys(a)});
+    const known = new Set((s.accounts||[]).map(a=>a.id));
+    const accounts = [
+      ...(s.accounts||[]).map(a=>fresh[a.id] ? {...a, ...tag(fresh[a.id])} : a),
+      ...Object.values(fresh).filter(a=>!known.has(a.id)).map(tag),
+    ];
+    const txnIds = new Set((s.transactions||[]).map(t=>t.id));
+    const newTxns = bankData.transactions.filter(t=>!txnIds.has(t.id)).map(t=>{ const r=rules[merchantKey(t.description)]; return r?{...t,category:r}:t; });
+    const plaidTokens = (s.plaidTokens||[]).map(t=>t.item_id===token.item_id ? {...t, syncedAt:bankData.syncedAt, liabilities:bankData.liabilities, error:null} : t);
+    return { accounts, transactions:[...(s.transactions||[]),...newTxns], plaidTokens };
+  };
+
+  const syncOne = async token => {
     try {
-      const dataResp = await fetch("/api/get-data", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ access_token: token.access_token })
+      const data = await post("/api/get-data", { access_token:token.access_token });
+      update(s=>mergeBank(s, data, token));
+    } catch(e) {
+      const msg = e.code==="ITEM_LOGIN_REQUIRED" ? "Your bank needs you to sign in again" : e.message;
+      update(s=>({plaidTokens:(s.plaidTokens||[]).map(t=>t.item_id===token.item_id?{...t,error:msg,syncedAt:new Date().toISOString()}:t)}));
+    }
+  };
+
+  const syncAll = async () => {
+    const tokens = state.plaidTokens||[];
+    if (!tokens.length || syncingRef.current) return;
+    syncingRef.current = true; setSyncing(true);
+    for (const t of tokens) await syncOne(t);
+    syncingRef.current = false; setSyncing(false);
+  };
+
+  // Live updates: sync on open, when you come back to the app, and every 30 minutes while it's open
+  const autoSync = useRef();
+  autoSync.current = () => {
+    const stale = (state.plaidTokens||[]).some(t=>!t.syncedAt || Date.now()-new Date(t.syncedAt).getTime() > 15*60000);
+    if (stale) syncAll();
+  };
+  useEffect(()=>{
+    autoSync.current();
+    const id = setInterval(()=>autoSync.current(), 30*60000);
+    const onVis = () => document.visibilityState==="visible" && autoSync.current();
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
+  }, []);
+
+  // Opens Plaid Link. With an access token it re-opens an existing connection (sign in again / allow card details).
+  const openLink = async (existing) => {
+    setPlaidLoading(true); setPlaidError(null);
+    try {
+      const lt = await post("/api/create-link-token", existing ? { access_token:existing.access_token } : {});
+      await new Promise((res, rej) => {
+        if (window.Plaid) return res();
+        const sc = document.createElement("script");
+        sc.src = "https://cdn.plaid.com/link/v2/stable/link-initialize.js";
+        sc.onload = res; sc.onerror = rej;
+        document.head.appendChild(sc);
       });
-      const bankData = await dataResp.json();
-      // Update balances and add new transactions
-      const updatedAccounts = (state.accounts||[]).map(a => {
-        const fresh = bankData.accounts.find(b=>b.id===a.id);
-        return fresh ? {...a, balance:fresh.balance, limit:fresh.limit ?? a.limit} : a;
-      });
-      const existingIds = new Set((state.transactions||[]).map(t=>t.id));
-      const rules = state.rules||{};
-      const newTxns = bankData.transactions.filter(t=>!existingIds.has(t.id)).map(t=>rules[merchantKey(t.description)]?{...t,category:rules[merchantKey(t.description)]}:t);
-      const ns = {...state, accounts:updatedAccounts, transactions:[...(state.transactions||[]),...newTxns]};
-      setState(ns); saveState(ns);
-    } catch(e) { setPlaidError("Refresh failed: "+e.message); }
-    setPlaidLoading(false);
+      window.Plaid.create({
+        token: lt.link_token,
+        onSuccess: async (public_token, metadata) => {
+          try {
+            let token = existing;
+            if (!existing) {
+              const ex = await post("/api/exchange-token", { public_token });
+              token = { access_token:ex.access_token, item_id:ex.item_id, institution:metadata.institution?.name||"Bank" };
+              update(s=>({plaidTokens:[...(s.plaidTokens||[]), token]}));
+            }
+            await syncOne(token);
+          } catch(e) { setPlaidError("Error importing data: "+e.message); }
+          setPlaidLoading(false);
+        },
+        onExit: () => setPlaidLoading(false),
+      }).open();
+    } catch(e) { setPlaidError(e.message); setPlaidLoading(false); }
+  };
+  const disconnect = t => {
+    if (!window.confirm(`Disconnect ${t.institution}? Its accounts stay in Ascend but stop updating.`)) return;
+    update(s=>({
+      plaidTokens:(s.plaidTokens||[]).filter(x=>x.item_id!==t.item_id),
+      accounts:(s.accounts||[]).map(a=>a.itemId===t.item_id?{...a,linked:false,bankFields:[]}:a),
+    }));
   };
   const [showAddTxn, setShowAddTxn] = useState(false);
   const [newAcct, setNewAcct] = useState({name:"",institution:"",balance:"",limit:"",type:"checking"});
@@ -592,7 +607,6 @@ function MoneyTab({ state, setState, apiKey }) {
   const accounts = state.accounts || [];
   const subs = state.subscriptions || [];
 
-  const update = fn => setState(s => ({...s, ...fn(s)}));
   const monthsWithData = [...new Set(txns.map(t=>monthKey(t.date)).filter(m=>/^\d{4}-\d{2}$/.test(m)))];
   const monthOptions = [...new Set([thisMonth(), ...monthsWithData])].sort().reverse();
   const [month, setMonth] = useState(()=>monthsWithData.includes(thisMonth())||!monthsWithData.length ? thisMonth() : monthsWithData.sort().pop());
@@ -738,23 +752,44 @@ function MoneyTab({ state, setState, apiKey }) {
 
           {/* Bank Linking */}
           <Card style={{marginBottom:12,borderLeft:`3px solid ${C.blue}`}}>
-            <div style={{fontWeight:800,fontSize:15,marginBottom:4}}>🏦 Connect Your Bank</div>
-            <div style={{fontSize:12,color:C.muted,marginBottom:12}}>Securely link your bank and credit cards via Plaid. Balances and transactions import automatically.</div>
-            {plaidError && <div style={{background:C.negLt,borderRadius:8,padding:"8px 12px",fontSize:12,color:C.neg,marginBottom:10}}>{plaidError}</div>}
-            <Btn variant="blue" style={{width:"100%",background:C.blue,color:"#FFF",border:"none"}} onClick={connectBank} disabled={plaidLoading}>
-              {plaidLoading ? <><Spinner size={14}/> Connecting…</> : "🔗 Connect Bank or Credit Card"}
-            </Btn>
-            {(state.plaidTokens||[]).length > 0 && (
-              <div style={{marginTop:12}}>
-                <div style={{fontSize:12,color:C.muted,marginBottom:6}}>Connected institutions:</div>
-                {(state.plaidTokens||[]).map((t,i)=>(
-                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderTop:`1px solid ${C.border}`}}>
-                    <div style={{fontSize:13,fontWeight:600}}>{t.institution}</div>
-                    <Btn variant="ghost" size="sm" onClick={()=>refreshBank(t)}>🔄 Refresh</Btn>
-                  </div>
-                ))}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+              <div>
+                <div style={{fontWeight:800,fontSize:15,marginBottom:4}}>🏦 Linked Banks & Cards</div>
+                <div style={{fontSize:12,color:C.muted,marginBottom:12}}>Link through Plaid. Balances, limits, APRs, minimum payments, and statement & due dates update automatically.</div>
               </div>
-            )}
+              {(state.plaidTokens||[]).length>0 && <Btn variant="ghost" size="sm" onClick={syncAll} disabled={syncing}>{syncing?<><Spinner size={12} color={C.ink}/> Syncing</>:"🔄 Sync"}</Btn>}
+            </div>
+            {plaidError && <div style={{background:C.negLt,borderRadius:8,padding:"8px 12px",fontSize:12,color:C.neg,marginBottom:10}}>{plaidError}</div>}
+            {(state.plaidTokens||[]).map(t=>{
+              const liab = t.liabilities;
+              return (
+                <div key={t.item_id||t.access_token} style={{padding:"8px 0",borderTop:`1px solid ${C.border}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700}}>{t.institution}</div>
+                      <div style={{fontSize:11,color:t.error?C.neg:C.muted}}>{t.error ? `⚠️ ${t.error}` : t.syncedAt ? `Synced ${timeAgo(t.syncedAt)}` : "Not synced yet"}</div>
+                    </div>
+                    <div style={{display:"flex",gap:4}}>
+                      {t.error && <Btn variant="primary" size="sm" onClick={()=>openLink(t)}>Reconnect</Btn>}
+                      <button onClick={()=>disconnect(t)} title="Disconnect" style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:14}}>✕</button>
+                    </div>
+                  </div>
+                  {!t.error && liab && liab!=="ok" && (
+                    ["PRODUCTS_NOT_SUPPORTED","NO_LIABILITY_ACCOUNTS"].includes(liab)
+                      ? <div style={{fontSize:11,color:C.muted,marginTop:4}}>This bank doesn't share card details, so enter APR and due day under Credit & Debt.</div>
+                      : liab==="PRODUCT_NOT_READY"
+                        ? <div style={{fontSize:11,color:C.muted,marginTop:4}}>Card details are still loading from your bank. They'll appear on the next sync.</div>
+                        : <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginTop:6,background:C.goldLt,borderRadius:8,padding:"6px 10px"}}>
+                            <span style={{fontSize:11,color:C.sub}}>Allow Ascend to read card limits, APRs & due dates</span>
+                            <Btn variant="gold" size="sm" onClick={()=>openLink(t)}>Allow</Btn>
+                          </div>
+                  )}
+                </div>
+              );
+            })}
+            <Btn variant="blue" style={{width:"100%",background:C.blue,color:"#FFF",border:"none",marginTop:(state.plaidTokens||[]).length?8:0}} onClick={()=>openLink()} disabled={plaidLoading}>
+              {plaidLoading ? <><Spinner size={14}/> Connecting…</> : "🔗 Link a Bank or Credit Card"}
+            </Btn>
           </Card>
 
           {/* Accounts */}
@@ -788,7 +823,7 @@ function MoneyTab({ state, setState, apiKey }) {
               <div key={a.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${C.border}`}}>
                 <div>
                   <div style={{fontWeight:700,fontSize:14}}>{a.name}</div>
-                  <div style={{fontSize:11,color:C.muted}}>{a.institution} · {a.type}</div>
+                  <div style={{fontSize:11,color:C.muted}}>{a.institution} · {a.type}{a.linked?" · 🔗 live":""}</div>
                 </div>
                 <div style={{fontWeight:800,fontSize:15,color:a.type==="credit"||a.type==="loan"?C.neg:C.pos}}>
                   {a.type==="credit"||a.type==="loan"?"-":""}${(a.balance||0).toLocaleString()}
@@ -986,6 +1021,9 @@ const thisMonth = () => { const d=new Date(); return `${d.getFullYear()}-${pad2(
 const monthKey = d => (d||"").slice(0,7);
 const monthLabel = k => { const [y,m]=k.split("-").map(Number); return new Date(y,m-1,1).toLocaleDateString("en-US",{month:"short",year:"numeric"}); };
 const shiftMonth = (k, n) => { const [y,m]=k.split("-").map(Number); const d=new Date(y,m-1+n,1); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}`; };
+const timeAgo = iso => { const m=Math.round((Date.now()-new Date(iso).getTime())/60000); return m<1?"just now":m<60?`${m} min ago`:m<1440?`${Math.round(m/60)} hr ago`:`${Math.round(m/1440)} days ago`; };
+const daysUntilDate = iso => { if (!iso) return null; const [y,m,d]=iso.split("-").map(Number); const now=new Date(); return Math.round((new Date(y,m-1,d)-new Date(now.getFullYear(),now.getMonth(),now.getDate()))/86400000); };
+const shortDate = iso => { const [y,m,d]=iso.split("-").map(Number); return new Date(y,m-1,d).toLocaleDateString("en-US",{month:"short",day:"numeric"}); };
 const isExpense = t => t.amount<0 && t.category!=="Transfer";
 const isIncome = t => t.amount>0 && t.category!=="Transfer";
 const isDebt = a => a.type==="credit"||a.type==="loan";
@@ -1211,7 +1249,9 @@ function RecurringView({ state, update }) {
   const detected = detectRecurring(state.transactions||[], subs);
   const active = subs.filter(s=>s.status==="active");
   const monthly = active.reduce((a,s)=>a+s.amount,0);
-  const upcoming = active.filter(s=>s.dueDay).map(s=>({...s,days:daysUntilDay(s.dueDay)})).sort((a,b)=>a.days-b.days);
+  const cardDue = (state.accounts||[]).filter(a=>isDebt(a)&&a.nextDueDate&&daysUntilDate(a.nextDueDate)>=0)
+    .map(a=>({id:`acct-${a.id}`,name:`💳 ${a.name} payment`,amount:a.minPayment||0,days:daysUntilDate(a.nextDueDate)}));
+  const upcoming = [...active.filter(s=>s.dueDay).map(s=>({...s,days:daysUntilDay(s.dueDay)})), ...cardDue].sort((a,b)=>a.days-b.days);
   const add = s => update(st=>({subscriptions:[...(st.subscriptions||[]),{id:Date.now()+Math.random(),status:"active",...s}]}));
   const setStatus = (id,status) => update(st=>({subscriptions:(st.subscriptions||[]).map(s=>s.id===id?{...s,status}:s)}));
   const remove = id => update(st=>({subscriptions:(st.subscriptions||[]).filter(s=>s.id!==id)}));
@@ -1405,7 +1445,7 @@ function DebtView({ state, update }) {
       </Card>
 
       <Card style={{marginBottom:12}}>
-        <SectionTitle sub="Enter limit, APR, minimum payment and statement-close day for each card or loan.">🧾 Your Debts</SectionTitle>
+        <SectionTitle sub="Linked cards fill in automatically. For anything else, enter the limit, APR, minimum payment and statement-close day.">🧾 Your Debts</SectionTitle>
         {debts.length===0 && <div style={{fontSize:13,color:C.muted}}>No credit cards or loans yet. Add them in Overview → Accounts.</div>}
         {debts.map(a=>{
           const p = a.type==="credit"&&a.limit>0 ? (a.balance||0)/a.limit*100 : null;
@@ -1428,11 +1468,23 @@ function DebtView({ state, update }) {
                   {f:"minPayment",l:"Min $"},
                   a.type==="credit" && {f:"closeDay",l:"Closes day"},
                 ].filter(Boolean).map(x=>(
-                  <label key={x.f} style={{fontSize:10,color:C.muted}}>{x.l}
-                    <input type="number" inputMode="decimal" key={`${a.id}-${x.f}-${a[x.f]}`} defaultValue={a[x.f]??""} onBlur={e=>setField(a.id,x.f,e.target.value)} style={{...inp,padding:"5px 6px",marginTop:2}}/>
-                  </label>
+                  (a.bankFields||[]).includes(x.f)
+                    ? <div key={x.f} style={{fontSize:10,color:C.muted}}>{x.l} 🔗
+                        <div style={{...inp,padding:"5px 6px",marginTop:2,background:C.surfaceAlt,fontWeight:700,color:C.ink}}>{a[x.f]}</div>
+                      </div>
+                    : <label key={x.f} style={{fontSize:10,color:C.muted}}>{x.l}
+                        <input type="number" inputMode="decimal" key={`${a.id}-${x.f}-${a[x.f]}`} defaultValue={a[x.f]??""} onBlur={e=>setField(a.id,x.f,e.target.value)} style={{...inp,padding:"5px 6px",marginTop:2}}/>
+                      </label>
                 ))}
               </div>
+              {a.isOverdue && <div style={{fontSize:12,color:C.neg,fontWeight:700,marginTop:8}}>🚨 This account is past due. Pay at least the minimum now to avoid a late mark on your report.</div>}
+              {a.nextDueDate && (()=>{ const dd=daysUntilDate(a.nextDueDate); return (
+                <div style={{fontSize:12,color:C.sub,marginTop:8}}>
+                  📅 Payment due <strong style={{color:dd!=null&&dd<=5?C.neg:C.ink}}>{shortDate(a.nextDueDate)}{dd!=null&&dd>=0?` (${dd===0?"today":`in ${dd} days`})`:""}</strong>
+                  {a.minPayment!=null && <> · min {money(a.minPayment,2)}</>}
+                  {a.lastStatementBalance!=null && <> · last statement {money(a.lastStatementBalance,2)}</>}
+                </div>); })()}
+              {a.linked && <div style={{fontSize:10,color:C.muted,marginTop:6}}>🔗 Fields marked 🔗 update automatically from your bank</div>}
               {p!=null && p>8 && (
                 <div style={{fontSize:12,color:C.sub,marginTop:8}}>
                   🎯 Pay <strong style={{color:C.pos}}>{money((a.balance||0)-target)}</strong> to leave {money(target)} (8%)
